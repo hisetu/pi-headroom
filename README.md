@@ -25,23 +25,36 @@ Then open pi and run:
 When you choose a supported provider in pi, the extension:
 
 - overrides that provider's `baseUrl` to a local Headroom proxy,
-- starts the proxy automatically if it is not already running,
-- runs one shared managed proxy per provider across pi sessions and agent processes,
-- does not attach to arbitrary external Headroom proxies,
+- expects one canonical local port per provider,
+- does **not** automatically start, stop, or restart proxies for you,
+- does **not** attach to arbitrary fallback ports,
 - shows proxy status in the pi footer,
-- shows dashboard URLs and routing details in `/headroom-status`.
+- shows expected ports, URLs, and routing details in `/headroom-status`.
 
-The goal is simple: install Headroom, install this pi package, then use supported providers in pi without manually starting proxies.
+The goal is simple: you manage Headroom yourself, and this package cleanly attaches pi to the expected local proxy.
+
+## Lifecycle model
+
+`pi-headroom` is **attach-only**.
+
+That means:
+
+- you decide whether a proxy should be running,
+- you can start Headroom yourself or use the explicit helper command `/headroom-start`,
+- you stop Headroom yourself,
+- this extension only checks whether the expected proxy is available and routes pi to it.
+
+If the proxy is not running, the extension tells you which port and URL are expected.
 
 ## Prerequisite
 
-You must install **Headroom** first. This package does **not** install Headroom for you. It expects the `headroom` CLI to be available on `PATH`.
+You must install **Headroom** first. This package does **not** install Headroom for you. It expects the `headroom` CLI to be available on `PATH` if you want to start proxies with the CLI yourself.
 
-If Headroom is missing, the extension will:
+If Headroom is missing or your proxy is not running, the extension will:
 
 - warn clearly,
-- leave pi usable,
-- let unmanaged/default pi provider behavior continue.
+- leave pi otherwise usable,
+- tell you which provider port should be started.
 
 ## Install
 
@@ -79,13 +92,26 @@ If pi is already running, reload extensions:
 /reload
 ```
 
+A sample `docker-compose.yml` is included in this package root if you want to run Headroom proxies with Docker. A matching `.env.example` is also included for upstream override values.
+
+### 3. Optional: configure Docker env overrides
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` if you want to point a provider at a different upstream.
+
+For `github-copilot` in Docker, prefer setting an explicit `GITHUB_COPILOT_TOKEN` or `GITHUB_COPILOT_GITHUB_TOKEN` in `.env`. Docker containers generally cannot reuse your host keychain/session auth the same way local host processes can.
+
 ## Enable / use
 
 1. Open pi.
 2. Select a supported provider/model with `/model`.
-3. Start using the model normally.
+3. If you want traffic to go through Headroom, make sure the matching proxy is running on its expected local port.
+4. Start using the model normally.
 
-The extension will auto-start the matching local Headroom proxy when needed.
+If the proxy is not running, pi-headroom falls back to the provider default and tells you what to start if you want Headroom attached.
 
 ## Quick verification
 
@@ -98,9 +124,11 @@ Inside pi:
 You should see:
 
 - the current managed provider,
-- the current routed local base URL,
-- the active dashboard URL,
-- the managed provider proxy state.
+- the expected local proxy root URL,
+- the expected routed base URL,
+- the dashboard URL,
+- whether the proxy is currently reachable,
+- whether pi is currently attached to Headroom or falling back to the provider default.
 
 ## Supported providers
 
@@ -140,7 +168,9 @@ You should see:
 
 ## Default local ports
 
-Preferred ports with fallback scanning:
+Each provider has one canonical expected local port. If you override a provider port with environment variables, pi-headroom will expect that overridden port instead.
+
+Default ports:
 
 - `xai` → `8787`
 - `github-copilot` → `8788`
@@ -170,23 +200,33 @@ Preferred ports with fallback scanning:
 
 ## Commands
 
-### `/headroom-status`
+### `/headroom-status [provider|all]`
+
+If no provider is passed, it defaults to the provider of the currently selected model.
 
 Shows:
 
-- current provider,
-- current model base URL,
-- active dashboard URL,
-- proxy map,
-- managed/unmanaged behavior hints.
+- the current provider,
+- the current model base URL,
+- the expected local proxy root URL,
+- the expected routed base URL,
+- the dashboard URL,
+- observed running/unavailable status.
 
-### `/headroom-stop [provider|all]`
+This is the main diagnostic command in attach-only mode.
 
-Stop managed Headroom provider proxies.
+### `/headroom-start [provider|all]`
 
-### `/headroom-restart [provider|all]`
+Start Headroom on the canonical configured port for that provider.
 
-Restart managed Headroom provider proxies.
+If no provider is passed, it defaults to the provider of the currently selected model.
+
+This command:
+
+- only uses the provider's configured port,
+- does not choose fallback ports,
+- reports an error if the canonical port is occupied,
+- leaves stop/restart decisions to you.
 
 ## Footer status
 
@@ -196,15 +236,22 @@ The extension shows a lightweight status line in pi, for example:
 Headroom:openai running | hist saved 33.0M | $83.3 | 36%
 ```
 
+If the expected proxy is not running, you will see something like:
+
+```text
+Headroom:github-copilot unavailable | /headroom-start github-copilot
+```
+
 ## Important behavior
 
 - **Supported providers** are routed through Headroom.
 - **Unsupported providers** fall back to normal pi behavior.
-- If Headroom is missing, the extension warns and does **not** block normal pi usage.
-- By default, each provider uses one shared managed proxy that stays available across pi sessions and agent processes.
-- Proxy startup is serialized across processes so one provider converges on one managed proxy.
-- If a managed provider proxy becomes unhealthy, the extension automatically stops and restarts it on demand.
-- Footer perf numbers prefer Headroom Historical Proxy Compression data (`/stats-history` lifetime stats, with `/stats` fallback), so they survive proxy restarts better than per-process runtime counters.
+- The extension does not automatically manage proxy lifecycle.
+- There is no automatic stop, restart, recovery, or fallback-port migration.
+- `/headroom-start` is an explicit user-triggered helper, not background lifecycle management.
+- One provider maps to one expected local proxy port.
+- If the expected proxy is unavailable, the extension falls back to the provider default and tells you what should be running and where.
+- Footer perf numbers prefer Headroom Historical Proxy Compression data (`/stats-history` lifetime stats, with `/stats` fallback).
 - GitHub Copilot keeps pi's built-in OAuth flow and re-routes the final base URL through Headroom.
 
 ## Useful environment
@@ -213,12 +260,9 @@ Common ones:
 
 - `PI_HEADROOM_BIN`
 - `PI_HEADROOM_HOST`
-- `PI_HEADROOM_AUTOSTART`
 - `PI_HEADROOM_VERBOSE`
-- `PI_HEADROOM_PORT_SCAN_LIMIT`
-- `PI_HEADROOM_STATE_DIR`
-- `PI_HEADROOM_START_LOCK_WAIT_MS`
-- `PI_HEADROOM_START_LOCK_STALE_MS`
+- `PI_HEADROOM_PROBE_TIMEOUT_MS`
+- `PI_HEADROOM_HEALTH_TTL_MS`
 
 Each provider also has optional port/upstream overrides such as:
 
@@ -249,7 +293,7 @@ These pi providers still need more provider-specific handling and are not yet ma
 
 Local source layout:
 
-- `index.ts` — main supervisor logic
+- `index.ts` — main attach-only supervisor logic
 - `provider-registry.ts` — provider registry and routing specs
 
 Install locally during development:
