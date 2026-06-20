@@ -162,7 +162,10 @@ function makeSimpleProviderSpec(
   };
 }
 
-const OPENAI_FAMILY_ENV = { LITELLM_SUPPRESS_DEBUG_INFO: "True" };
+const OPENAI_FAMILY_ENV = {
+  HEADROOM_BACKEND: "openai",
+  LITELLM_SUPPRESS_DEBUG_INFO: "True",
+};
 
 const PROVIDER_SPECS: Record<ManagedProvider, ManagedProviderSpec> = {
   xai: makeSimpleProviderSpec({
@@ -184,6 +187,7 @@ const PROVIDER_SPECS: Record<ManagedProvider, ManagedProviderSpec> = {
     defaultPreferredPort: 8788,
     buildProxyEnv() {
       return {
+        HEADROOM_BACKEND: "openai",
         OPENAI_TARGET_API_URL:
           process.env.PI_HEADROOM_COPILOT_UPSTREAM?.trim() ||
           "https://api.githubcopilot.com",
