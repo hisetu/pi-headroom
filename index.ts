@@ -1,28 +1,19 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
 import {
   buildManagedProxyConfig,
   managedProviderFor,
   preferredPortFor,
   providerIds,
-  registerManagedProviders,
+  registerManagedProvider,
   type ManagedProvider,
   type ManagedProxyConfig,
   type ProviderModel,
 } from "./provider-registry.ts";
 
-type StatusLevel =
-  | "idle"
-  | "starting"
-  | "running"
-  | "failed"
-  | "stopped";
+type StatusLevel = "idle" | "running" | "unavailable";
 type UiLevel = "info" | "warn" | "error" | "success";
-type PortDisposition = "headroom" | "free" | "occupied";
 
 type ExtensionCtx = {
   model?: ProviderModel;
@@ -39,40 +30,9 @@ interface ManagedProxyState {
   port: number;
   rootUrl: string;
   routedBaseUrl: string;
-  pid?: number;
-  process?: ChildProcess;
   status: StatusLevel;
   lastHealthyAt?: number;
   lastError?: string;
-}
-
-interface RouteMetadata {
-  provider: ManagedProvider;
-  port: number;
-  rootUrl: string;
-  routedBaseUrl: string;
-  version: number;
-}
-
-interface ServiceMetadata {
-  provider: ManagedProvider;
-  pid: number;
-  port: number;
-  startedAt: string;
-  version: number;
-}
-
-interface StartLockMetadata {
-  provider: ManagedProvider;
-  pid: number;
-  token: string;
-  acquiredAt: string;
-  version: number;
-}
-
-interface PortAssessment {
-  disposition: PortDisposition;
-  config: ManagedProxyConfig;
 }
 
 interface PerfSummary {
@@ -85,23 +45,17 @@ interface PerfSummary {
 
 interface SupervisorState {
   proxies: Map<ManagedProvider, ManagedProxyState>;
-  pending: Map<ManagedProvider, Promise<ManagedProxyState>>;
   perf: Map<ManagedProvider, PerfSummary>;
-  installWarningShown: boolean;
 }
 
-const METADATA_VERSION = 1;
 const STATUS_SLOT = "pi-headroom";
 const DEFAULT_HOST = process.env.PI_HEADROOM_HOST?.trim() || "127.0.0.1";
 const HEADROOM_BIN = process.env.PI_HEADROOM_BIN?.trim() || "headroom";
 const STATUS_COMMAND =
   process.env.PI_HEADROOM_STATUS_COMMAND?.trim() || "headroom-status";
-const STOP_COMMAND =
-  process.env.PI_HEADROOM_STOP_COMMAND?.trim() || "headroom-stop";
-const RESTART_COMMAND =
-  process.env.PI_HEADROOM_RESTART_COMMAND?.trim() || "headroom-restart";
-const VERBOSE = isEnabled(process.env.PI_HEADROOM_VERBOSE);
-const AUTOSTART = isDefaultEnabled(process.env.PI_HEADROOM_AUTOSTART, true);
+const START_COMMAND =
+  process.env.PI_HEADROOM_START_COMMAND?.trim() || "headroom-start";
+const VERBOSE = /^(1|true|yes|on)$/i.test(process.env.PI_HEADROOM_VERBOSE ?? "");
 const PROBE_TIMEOUT_MS = parsePositiveInt(
   process.env.PI_HEADROOM_PROBE_TIMEOUT_MS,
   1500,
@@ -118,36 +72,13 @@ const HEALTH_TTL_MS = parsePositiveInt(
   process.env.PI_HEADROOM_HEALTH_TTL_MS,
   5000,
 );
-const PORT_SCAN_LIMIT = parsePositiveInt(
-  process.env.PI_HEADROOM_PORT_SCAN_LIMIT,
-  20,
-);
-const STATE_DIR =
-  process.env.PI_HEADROOM_STATE_DIR?.trim() ||
-  join(homedir(), ".headroom", "pi-supervisor");
-const START_LOCK_WAIT_MS = parsePositiveInt(
-  process.env.PI_HEADROOM_START_LOCK_WAIT_MS,
-  START_TIMEOUT_MS + 5000,
-);
-const START_LOCK_STALE_MS = parsePositiveInt(
-  process.env.PI_HEADROOM_START_LOCK_STALE_MS,
-  Math.max(START_TIMEOUT_MS * 2, 60_000),
-);
 
-let resolvedConfigs: Record<ManagedProvider, ManagedProxyConfig> | undefined;
-let initPromise:
-  | Promise<Record<ManagedProvider, ManagedProxyConfig>>
-  | undefined;
-let headroomInstallProblem: string | undefined;
-
-function isEnabled(raw: string | undefined): boolean {
-  return /^(1|true|yes|on)$/i.test(raw ?? "");
-}
-
-function isDefaultEnabled(raw: string | undefined, fallback: boolean): boolean {
-  if (!raw?.trim()) return fallback;
-  return isEnabled(raw);
-}
+const resolvedConfigs = Object.fromEntries(
+  providerIds().map((provider) => [
+    provider,
+    buildManagedProxyConfig(provider, preferredPortFor(provider), DEFAULT_HOST),
+  ]),
+) as Record<ManagedProvider, ManagedProxyConfig>;
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (!raw?.trim()) return fallback;
@@ -155,45 +86,23 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-
-function routeMetadataPath(provider: ManagedProvider): string {
-  return join(STATE_DIR, "routes", `${provider}.json`);
-}
-
-function serviceMetadataPath(provider: ManagedProvider): string {
-  return join(STATE_DIR, "services", `${provider}.json`);
-}
-
-function startLockPath(provider: ManagedProvider): string {
-  return join(STATE_DIR, "locks", `${provider}.json`);
-}
-
 function globalState(): SupervisorState {
   const g = globalThis as typeof globalThis & {
     __piHeadroomSupervisor__?: Partial<SupervisorState>;
   };
-  if (!g.__piHeadroomSupervisor__) {
-    g.__piHeadroomSupervisor__ = {};
-  }
-
+  if (!g.__piHeadroomSupervisor__) g.__piHeadroomSupervisor__ = {};
   const state = g.__piHeadroomSupervisor__;
   if (!(state.proxies instanceof Map)) state.proxies = new Map();
-  if (!(state.pending instanceof Map)) state.pending = new Map();
   if (!(state.perf instanceof Map)) state.perf = new Map();
-  if (typeof state.installWarningShown !== "boolean")
-    state.installWarningShown = false;
-
   return state as SupervisorState;
 }
 
-function processAlive(pid: number | undefined): boolean {
-  if (!pid || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+function getConfig(provider: ManagedProvider): ManagedProxyConfig {
+  return resolvedConfigs[provider];
+}
+
+function dashboardUrl(config: ManagedProxyConfig): string {
+  return `${config.rootUrl}/dashboard`;
 }
 
 function buildBaseState(config: ManagedProxyConfig): ManagedProxyState {
@@ -202,203 +111,8 @@ function buildBaseState(config: ManagedProxyConfig): ManagedProxyState {
     port: config.port,
     rootUrl: config.rootUrl,
     routedBaseUrl: config.routedBaseUrl,
-    status: "stopped",
+    status: "idle",
   };
-}
-
-function readJsonFile<T>(path: string): T | undefined {
-  try {
-    return JSON.parse(readFileSync(path, "utf8")) as T;
-  } catch {
-    return undefined;
-  }
-}
-
-function loadRoute(provider: ManagedProvider): RouteMetadata | undefined {
-  const raw = readJsonFile<Partial<RouteMetadata>>(routeMetadataPath(provider));
-  if (
-    !raw ||
-    raw.provider !== provider ||
-    typeof raw.port !== "number" ||
-    typeof raw.rootUrl !== "string" ||
-    typeof raw.routedBaseUrl !== "string"
-  ) {
-    return undefined;
-  }
-  return {
-    provider,
-    port: raw.port,
-    rootUrl: raw.rootUrl,
-    routedBaseUrl: raw.routedBaseUrl,
-    version: typeof raw.version === "number" ? raw.version : METADATA_VERSION,
-  };
-}
-
-function saveRoute(config: ManagedProxyConfig): void {
-  const path = routeMetadataPath(config.provider);
-  mkdirSync(dirname(path), { recursive: true });
-  const payload: RouteMetadata = {
-    provider: config.provider,
-    port: config.port,
-    rootUrl: config.rootUrl,
-    routedBaseUrl: config.routedBaseUrl,
-    version: METADATA_VERSION,
-  };
-  writeFileSync(path, JSON.stringify(payload, null, 2));
-}
-
-function normalizeServiceMetadata(
-  provider: ManagedProvider,
-  raw: Partial<ServiceMetadata> | undefined,
-): ServiceMetadata | undefined {
-  if (
-    !raw ||
-    raw.provider !== provider ||
-    typeof raw.pid !== "number" ||
-    typeof raw.port !== "number"
-  ) {
-    return undefined;
-  }
-
-  return {
-    provider,
-    pid: raw.pid,
-    port: raw.port,
-    startedAt:
-      typeof raw.startedAt === "string"
-        ? raw.startedAt
-        : new Date().toISOString(),
-    version:
-      typeof raw.version === "number" ? raw.version : METADATA_VERSION,
-  };
-}
-
-function loadServiceMetadata(
-  provider: ManagedProvider,
-): ServiceMetadata | undefined {
-  return normalizeServiceMetadata(
-    provider,
-    readJsonFile<Partial<ServiceMetadata>>(serviceMetadataPath(provider)),
-  );
-}
-
-function saveServiceMetadata(
-  config: ManagedProxyConfig,
-  proxy: ManagedProxyState,
-): void {
-  if (!proxy.pid) return;
-  const path = serviceMetadataPath(config.provider);
-  mkdirSync(dirname(path), { recursive: true });
-  const payload: ServiceMetadata = {
-    provider: config.provider,
-    pid: proxy.pid,
-    port: config.port,
-    startedAt: new Date().toISOString(),
-    version: METADATA_VERSION,
-  };
-  writeFileSync(path, JSON.stringify(payload, null, 2));
-}
-
-function clearServiceMetadata(provider: ManagedProvider): void {
-  rmSync(serviceMetadataPath(provider), { force: true });
-}
-
-function normalizeStartLockMetadata(
-  provider: ManagedProvider,
-  raw: Partial<StartLockMetadata> | undefined,
-): StartLockMetadata | undefined {
-  if (
-    !raw ||
-    raw.provider !== provider ||
-    typeof raw.pid !== "number" ||
-    typeof raw.token !== "string" ||
-    typeof raw.acquiredAt !== "string"
-  ) {
-    return undefined;
-  }
-
-  return {
-    provider,
-    pid: raw.pid,
-    token: raw.token,
-    acquiredAt: raw.acquiredAt,
-    version:
-      typeof raw.version === "number" ? raw.version : METADATA_VERSION,
-  };
-}
-
-function readStartLockMetadata(
-  provider: ManagedProvider,
-): StartLockMetadata | undefined {
-  return normalizeStartLockMetadata(
-    provider,
-    readJsonFile<Partial<StartLockMetadata>>(startLockPath(provider)),
-  );
-}
-
-function isStartLockStale(lock: StartLockMetadata): boolean {
-  if (!processAlive(lock.pid)) return true;
-  const acquiredAt = Date.parse(lock.acquiredAt);
-  if (!Number.isFinite(acquiredAt)) return true;
-  return Date.now() - acquiredAt > START_LOCK_STALE_MS;
-}
-
-function releaseStartLock(provider: ManagedProvider, token: string): void {
-  const current = readStartLockMetadata(provider);
-  if (!current || current.token !== token) return;
-  rmSync(startLockPath(provider), { force: true });
-}
-
-async function acquireStartLock(
-  provider: ManagedProvider,
-): Promise<() => void> {
-  const path = startLockPath(provider);
-  mkdirSync(dirname(path), { recursive: true });
-  const token =
-    `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt < START_LOCK_WAIT_MS) {
-    const payload: StartLockMetadata = {
-      provider,
-      pid: process.pid,
-      token,
-      acquiredAt: new Date().toISOString(),
-      version: METADATA_VERSION,
-    };
-
-    try {
-      writeFileSync(path, JSON.stringify(payload, null, 2), { flag: "wx" });
-      return () => releaseStartLock(provider, token);
-    } catch (error) {
-      const code =
-        error && typeof error === "object" && "code" in error
-          ? String((error as { code?: unknown }).code ?? "")
-          : "";
-      if (code !== "EEXIST") throw error;
-
-      const current = readStartLockMetadata(provider);
-      if (!current || isStartLockStale(current)) {
-        rmSync(path, { force: true });
-        continue;
-      }
-
-      await sleep(PROBE_INTERVAL_MS);
-    }
-  }
-
-  throw new Error(`Timed out waiting to acquire start lock for ${provider}.`);
-}
-
-function getConfig(provider: ManagedProvider): ManagedProxyConfig {
-  if (!resolvedConfigs) {
-    throw new Error("Headroom provider supervisor is not initialized yet.");
-  }
-  return resolvedConfigs[provider];
-}
-
-function dashboardUrl(config: ManagedProxyConfig): string {
-  return `${config.rootUrl}/dashboard`;
 }
 
 function formatCompactMetric(value: number): string {
@@ -421,69 +135,198 @@ function formatCompactUsd(value: number): string {
   return `$${value.toFixed(1)}`;
 }
 
-function deriveSavingsPercent(
-  tokensSaved: number,
-  totalInputTokens: number,
-): number {
+function deriveSavingsPercent(tokensSaved: number, totalInputTokens: number): number {
   const totalBefore = Math.max(0, totalInputTokens) + Math.max(0, tokensSaved);
   return totalBefore > 0 ? (tokensSaved / totalBefore) * 100 : 0;
 }
 
 function parsePerfSummary(payload: unknown): PerfSummary | undefined {
   if (!payload || typeof payload !== "object") return undefined;
+
   const data = payload as {
     lifetime?: {
-      requests?: number;
-      tokens_saved?: number;
-      compression_savings_usd?: number;
-      total_input_tokens?: number;
+      requests?: unknown;
+      tokens_saved?: unknown;
+      compression_savings_usd?: unknown;
+      total_input_tokens?: unknown;
     };
     persistent_savings?: {
       lifetime?: {
-        requests?: number;
-        tokens_saved?: number;
-        compression_savings_usd?: number;
-        total_input_tokens?: number;
+        requests?: unknown;
+        tokens_saved?: unknown;
+        compression_savings_usd?: unknown;
+        total_input_tokens?: unknown;
       };
     };
-    requests?: { total?: number };
-    tokens?: { saved?: number; savings_percent?: number };
+    requests?: { total?: unknown };
+    tokens?: { saved?: unknown; savings_percent?: unknown };
+    lifetime_stats?: {
+      total_requests?: unknown;
+      total_tokens_saved?: unknown;
+      total_input_tokens?: unknown;
+      total_estimated_savings_usd?: unknown;
+    };
+    total_requests?: unknown;
+    total_tokens_saved?: unknown;
+    total_input_tokens?: unknown;
+    total_estimated_savings_usd?: unknown;
   };
 
-  const lifetime = data.lifetime ?? data.persistent_savings?.lifetime;
-  if (
-    typeof lifetime?.requests === "number" &&
-    typeof lifetime?.tokens_saved === "number"
-  ) {
-    return {
-      requestCount: lifetime.requests,
-      tokensSaved: lifetime.tokens_saved,
-      savingsUsd:
-        typeof lifetime.compression_savings_usd === "number"
-          ? lifetime.compression_savings_usd
-          : undefined,
-      savingsPercent: deriveSavingsPercent(
-        lifetime.tokens_saved,
-        lifetime.total_input_tokens ?? 0,
-      ),
-      basis: "history",
-    };
+  const lifetime =
+    data.lifetime ?? data.persistent_savings?.lifetime ?? data.lifetime_stats;
+
+  if (lifetime && typeof lifetime === "object") {
+    const requestCount = numberOrZero(
+      "requests" in lifetime ? lifetime.requests : lifetime.total_requests,
+    );
+    const tokensSaved = numberOrZero(
+      "tokens_saved" in lifetime
+        ? lifetime.tokens_saved
+        : lifetime.total_tokens_saved,
+    );
+    const totalInputTokens = numberOrZero(
+      "total_input_tokens" in lifetime ? lifetime.total_input_tokens : undefined,
+    );
+    const savingsUsd = numberOrUndefined(
+      "compression_savings_usd" in lifetime
+        ? lifetime.compression_savings_usd
+        : lifetime.total_estimated_savings_usd,
+    );
+
+    if (requestCount > 0 || tokensSaved > 0 || typeof savingsUsd === "number") {
+      return {
+        requestCount,
+        tokensSaved,
+        savingsUsd,
+        savingsPercent: deriveSavingsPercent(tokensSaved, totalInputTokens),
+        basis: "history",
+      };
+    }
   }
 
-  const requestCount = data.requests?.total;
-  const tokensSaved = data.tokens?.saved;
-  const savingsPercent = data.tokens?.savings_percent;
-  if (typeof requestCount !== "number") return undefined;
-  if (typeof tokensSaved !== "number") return undefined;
-  if (typeof savingsPercent !== "number") return undefined;
-  return { requestCount, tokensSaved, savingsPercent, basis: "runtime" };
+  const requestCount = numberOrZero(
+    data.requests?.total ?? data.total_requests,
+  );
+  const tokensSaved = numberOrZero(
+    data.tokens?.saved ?? data.total_tokens_saved,
+  );
+  const explicitSavingsPercent = numberOrUndefined(data.tokens?.savings_percent);
+  const totalInputTokens = numberOrZero(data.total_input_tokens);
+  const savingsUsd = numberOrUndefined(data.total_estimated_savings_usd);
+
+  if (
+    requestCount === 0 &&
+    tokensSaved === 0 &&
+    explicitSavingsPercent === undefined &&
+    savingsUsd === undefined
+  ) {
+    return undefined;
+  }
+
+  return {
+    requestCount,
+    tokensSaved,
+    savingsUsd,
+    savingsPercent:
+      explicitSavingsPercent ??
+      deriveSavingsPercent(tokensSaved, totalInputTokens),
+    basis: "runtime",
+  };
+}
+
+function numberOrZero(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+async function probeUrl(url: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { method: "GET", signal: controller.signal });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeLiveness(rootUrl: string): Promise<boolean> {
+  for (const path of ["/livez", "/readyz", "/health"]) {
+    if (await probeUrl(`${rootUrl}${path}`)) return true;
+  }
+  return false;
+}
+
+function probePortBindable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = createServer();
+    let settled = false;
+
+    server.once("error", () => {
+      if (settled) return;
+      settled = true;
+      resolve(false);
+    });
+
+    server.once("listening", () => {
+      server.close(() => {
+        if (settled) return;
+        settled = true;
+        resolve(true);
+      });
+    });
+
+    server.listen(port, DEFAULT_HOST);
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForProxyReady(rootUrl: string): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < START_TIMEOUT_MS) {
+    if (await probeLiveness(rootUrl)) return true;
+    await sleep(PROBE_INTERVAL_MS);
+  }
+  return false;
+}
+
+async function refreshProxyState(provider: ManagedProvider): Promise<ManagedProxyState> {
+  const config = getConfig(provider);
+  const state = globalState();
+  const current = state.proxies.get(provider) ?? buildBaseState(config);
+  const healthy = await probeLiveness(config.rootUrl);
+  current.port = config.port;
+  current.rootUrl = config.rootUrl;
+  current.routedBaseUrl = config.routedBaseUrl;
+  current.status = healthy ? "running" : "unavailable";
+  current.lastHealthyAt = healthy ? Date.now() : undefined;
+  current.lastError = healthy ? undefined : buildUnavailableMessage(provider);
+  state.proxies.set(provider, current);
+  return current;
+}
+
+function isFreshHealthy(proxy: ManagedProxyState | undefined): boolean {
+  return !!proxy?.lastHealthyAt && Date.now() - proxy.lastHealthyAt < HEALTH_TTL_MS;
+}
+
+async function ensureObservedState(provider: ManagedProvider): Promise<ManagedProxyState> {
+  const current = globalState().proxies.get(provider);
+  if (isFreshHealthy(current)) return current as ManagedProxyState;
+  return refreshProxyState(provider);
 }
 
 async function refreshPerfSummary(
   provider: ManagedProvider,
   options: { fresh?: boolean } = {},
 ): Promise<void> {
-  if (headroomInstallProblem) return;
   const config = getConfig(provider);
   if (!(await probeLiveness(config.rootUrl))) return;
 
@@ -506,19 +349,44 @@ async function refreshPerfSummary(
   }
 }
 
+function shellEscape(value: string): string {
+  if (/^[A-Za-z0-9_\-./:=]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function buildStartCommand(provider: ManagedProvider): string {
+  const config = getConfig(provider);
+  const envAssignments = Object.entries(config.env)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${shellEscape(value)}`);
+  return [
+    ...envAssignments,
+    shellEscape(HEADROOM_BIN),
+    "proxy",
+    "--host",
+    shellEscape(DEFAULT_HOST),
+    "--port",
+    String(config.port),
+  ].join(" ");
+}
+
+function buildUnavailableMessage(provider: ManagedProvider): string {
+  const config = getConfig(provider);
+  return [
+    `Headroom proxy for ${provider} is not running.`,
+    `Expected port: ${config.port}`,
+    `Expected root URL: ${config.rootUrl}`,
+    `Expected routed base URL: ${config.routedBaseUrl}`,
+    `Start command: ${buildStartCommand(provider)}`,
+  ].join(" ");
+}
+
 function activeStatusLine(model: ProviderModel | undefined): string {
   const provider = managedProviderFor(model);
   if (!provider) return "Headroom: off";
-  if (headroomInstallProblem) return `Headroom:${provider} unavailable | pi defaults`;
 
-  const config = getConfig(provider);
-  const proxy = globalState().proxies.get(provider);
   const perf = globalState().perf.get(provider);
-  const status = proxy?.status ?? "idle";
-  const fallback =
-    config.port === config.preferredPort
-      ? ""
-      : ` fallback-from-${config.preferredPort}`;
+  const status = globalState().proxies.get(provider)?.status ?? "idle";
   const perfScope = perf?.basis === "history" ? "hist " : "";
   const usdSuffix =
     typeof perf?.savingsUsd === "number"
@@ -528,12 +396,13 @@ function activeStatusLine(model: ProviderModel | undefined): string {
     ? ` | ${perfScope}saved ${formatCompactMetric(perf.tokensSaved)}${usdSuffix} | ${formatSavingsPercent(perf.savingsPercent)}`
     : "";
 
-  if (status === "failed") return `Headroom:${provider} failed${fallback}`;
-  if (status === "starting") return `Headroom:${provider} starting${fallback}`;
   if (status === "running") {
-    return `Headroom:${provider} running${fallback}${perfSuffix}`;
+    return `Headroom:${provider} running${perfSuffix}`;
   }
-  return `Headroom:${provider} ${status}${fallback}${perfSuffix}`;
+  if (status === "unavailable") {
+    return `Headroom:${provider} unavailable | /${START_COMMAND} ${provider}`;
+  }
+  return `Headroom:${provider} idle | /${START_COMMAND} ${provider}`;
 }
 
 function isStaleCtxError(error: unknown): boolean {
@@ -580,515 +449,70 @@ function updateUiStatus(ctx: ExtensionCtx, model?: ProviderModel): void {
 function statusLines(model: ProviderModel | undefined): string[] {
   const activeProvider = managedProviderFor(model);
   const state = globalState();
-  const activeProxyLines = providerIds().flatMap((provider) => {
+  const relevantProviders = activeProvider
+    ? [activeProvider, ...providerIds().filter((provider) => provider !== activeProvider)]
+    : providerIds();
+
+  const proxyLines = relevantProviders.flatMap((provider) => {
     const config = getConfig(provider);
     const proxy = state.proxies.get(provider);
     const status = proxy?.status ?? "idle";
-    if (status === "idle" || status === "stopped") return [];
+    if (provider !== activeProvider && status !== "running") return [];
 
-    const service = proxy?.pid ? `service pid=${proxy.pid}` : "service";
-    const error = proxy?.lastError ? ` error=${proxy.lastError}` : "";
-    const fallback =
-      config.port === config.preferredPort
-        ? ""
-        : ` fallback-from=${config.preferredPort}`;
+    const detail =
+      status === "running"
+        ? `running @ ${config.rootUrl} (pi routed through Headroom)`
+        : `unavailable; expected ${config.rootUrl} (pi falls back to default provider)`;
     return [
-      `- ${provider}: ${config.routedBaseUrl} [${status}; ${service}]${fallback}${error}`,
+      `- ${provider}: ${detail}`,
+      `  routed base: ${config.routedBaseUrl}`,
       `  dashboard: ${dashboardUrl(config)}`,
     ];
   });
 
-  const activeCount = providerIds().filter((provider) => {
-    const status = state.proxies.get(provider)?.status ?? "idle";
-    return status !== "idle" && status !== "stopped";
-  }).length;
-
+  const activeConfig = activeProvider ? getConfig(activeProvider) : undefined;
   return [
     `Managed provider: ${activeProvider ?? "(current model is unmanaged)"}`,
     `Current model: ${model ? `${model.provider}/${model.id ?? "(unknown)"}` : "(none)"}`,
     `Current model base URL: ${model?.baseUrl ?? "(none)"}`,
-    `Active dashboard: ${activeProvider ? dashboardUrl(getConfig(activeProvider)) : "(none)"}`,
+    `Expected proxy root: ${activeConfig?.rootUrl ?? "(none)"}`,
+    `Expected routed base URL: ${activeConfig?.routedBaseUrl ?? "(none)"}`,
+    `Active dashboard: ${activeConfig ? dashboardUrl(activeConfig) : "(none)"}`,
     `Footer status: ${activeStatusLine(model)}`,
-    `Headroom CLI: ${headroomInstallProblem ?? "available"}`,
-    `Autostart: ${AUTOSTART ? "enabled" : "disabled"}`,
-    "Lifecycle: shared singleton per provider",
-    `Port scan limit: ${PORT_SCAN_LIMIT}`,
-    `Managed proxies: ${activeCount} active / ${providerIds().length} configured`,
-    "Unmanaged providers fall back to pi defaults.",
+    "Lifecycle: manual proxy management; this extension only attaches.",
+    activeConfig
+      ? `If unavailable, pi falls back to the provider default. Start Headroom manually on port ${activeConfig.port} to attach it.`
+      : "Select a managed provider to see expected Headroom port.",
     "Proxy map:",
-    ...(activeProxyLines.length
-      ? activeProxyLines
-      : ["(no active managed proxies)"]),
+    ...(proxyLines.length ? proxyLines : ["(no running managed provider proxies observed)"]),
   ];
 }
 
-function detectPlatformInstallHint(): string {
-  switch (process.platform) {
-    case "darwin":
-      return 'Install Headroom first, then reload pi. Example: curl -fsSL https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.sh | "$(brew --prefix bash)/bin/bash"';
-    case "linux":
-      return "Install Headroom first, then reload pi. Example: curl -fsSL https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.sh | bash";
-    case "win32":
-      return "Install Headroom first, then reload pi. Example: irm https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.ps1 | iex";
-    default:
-      return "Install Headroom first and ensure `headroom` command is available on PATH, then reload pi.";
-  }
-}
-
-function detectHeadroomInstallProblem(): string | undefined {
-  const result = spawnSync(HEADROOM_BIN, ["--help"], {
-    stdio: "ignore",
-  });
-  if (!result.error) return undefined;
-  const detail =
-    result.error instanceof Error ? result.error.message : String(result.error);
-  return `Headroom CLI not found via ${JSON.stringify(HEADROOM_BIN)}. ${detectPlatformInstallHint()} (${detail})`;
-}
-
-function notifyHeadroomUnavailable(
-  ctx: ExtensionCtx,
-  model?: ProviderModel,
-  opts: { once?: boolean } = {},
-): void {
-  const provider = managedProviderFor(model ?? currentModelOrUndefined(ctx));
-  if (!provider || !headroomInstallProblem) return;
-
-  const state = globalState();
-  if (opts.once && state.installWarningShown) return;
-  if (opts.once) state.installWarningShown = true;
-
-  notifyUi(
-    ctx,
-    `Headroom unavailable for ${provider}; using pi defaults. ${headroomInstallProblem}`,
-    "warn",
-  );
-}
-
-async function probeUrl(url: string): Promise<boolean> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-    });
-    return response.ok;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function probeLiveness(rootUrl: string): Promise<boolean> {
-  for (const path of ["/livez", "/readyz", "/health"]) {
-    if (await probeUrl(`${rootUrl}${path}`)) return true;
-  }
-  return false;
-}
-
-function probePortBindable(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const server = createServer();
-    let settled = false;
-
-    server.once("error", () => {
-      if (settled) return;
-      settled = true;
-      resolve(false);
-    });
-
-    server.once("listening", () => {
-      server.close(() => {
-        if (settled) return;
-        settled = true;
-        resolve(true);
-      });
-    });
-
-    server.listen(port, DEFAULT_HOST);
-  });
-}
-
-async function assessPort(
-  provider: ManagedProvider,
-  port: number,
-): Promise<PortAssessment> {
-  const config = buildManagedProxyConfig(provider, port, DEFAULT_HOST);
-  if (await probeLiveness(config.rootUrl)) {
-    return { disposition: "headroom", config };
-  }
-  if (await probePortBindable(port)) {
-    return { disposition: "free", config };
-  }
-  return { disposition: "occupied", config };
-}
-
-async function resolveInitialConfig(
-  provider: ManagedProvider,
-): Promise<ManagedProxyConfig> {
-  const preferredPort = preferredPortFor(provider);
-  const savedRoute = loadRoute(provider);
-  const service = loadServiceMetadata(provider);
-  const candidatePorts: number[] = [];
-  const addCandidate = (port: number | undefined) => {
-    if (!port || port <= 0 || candidatePorts.includes(port)) return;
-    candidatePorts.push(port);
-  };
-
-  addCandidate(service?.port);
-  addCandidate(savedRoute?.port);
-  addCandidate(preferredPort);
-  for (let offset = 1; offset <= PORT_SCAN_LIMIT; offset += 1) {
-    addCandidate(preferredPort + offset);
-  }
-
-  let preferredOccupied: PortAssessment | undefined;
-  for (const port of candidatePorts) {
-    const assessment = await assessPort(provider, port);
-    const isManagedServicePort =
-      assessment.disposition === "headroom" &&
-      !!service &&
-      service.port === port &&
-      processAlive(service.pid);
-    if (assessment.disposition === "free" || isManagedServicePort) {
-      saveRoute(assessment.config);
-      return assessment.config;
-    }
-    if (!preferredOccupied && port === preferredPort) {
-      preferredOccupied = assessment;
-    }
-  }
-
-  const fallback =
-    preferredOccupied?.config ??
-    buildManagedProxyConfig(provider, preferredPort, DEFAULT_HOST);
-  saveRoute(fallback);
-  return fallback;
-}
-
-async function initializeConfigs(): Promise<
-  Record<ManagedProvider, ManagedProxyConfig>
-> {
-  if (resolvedConfigs) return resolvedConfigs;
-  if (initPromise) return initPromise;
-
-  initPromise = (async () => {
-    const entries = await Promise.all(
-      providerIds().map(
-        async (provider) =>
-          [provider, await resolveInitialConfig(provider)] as const,
-      ),
-    );
-    resolvedConfigs = Object.fromEntries(entries) as Record<
-      ManagedProvider,
-      ManagedProxyConfig
-    >;
-    return resolvedConfigs;
-  })();
-
-  return initPromise;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function waitForReady(
-  config: ManagedProxyConfig,
-  proxy: ManagedProxyState,
-): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < START_TIMEOUT_MS) {
-    if (await probeLiveness(config.rootUrl)) {
-      markHealthy(proxy);
-      return;
-    }
-    if (
-      proxy.process?.exitCode !== null &&
-      proxy.process?.exitCode !== undefined
-    ) {
-      throw new Error(
-        `headroom proxy exited early with code ${proxy.process.exitCode}`,
-      );
-    }
-    await sleep(PROBE_INTERVAL_MS);
-  }
-  throw new Error(
-    `Timed out waiting for ${config.provider} proxy at ${config.rootUrl}`,
-  );
-}
-
-function markHealthy(proxy: ManagedProxyState): ManagedProxyState {
-  proxy.status = "running";
-  proxy.lastHealthyAt = Date.now();
-  proxy.lastError = undefined;
-  return proxy;
-}
-
-function isFreshHealthy(
-  proxy: ManagedProxyState | undefined,
-): proxy is ManagedProxyState {
-  return (
-    !!proxy?.lastHealthyAt && Date.now() - proxy.lastHealthyAt < HEALTH_TTL_MS
-  );
-}
-
-function spawnProxy(config: ManagedProxyConfig): ManagedProxyState {
-  const child = spawn(
-    HEADROOM_BIN,
-    ["proxy", "--host", DEFAULT_HOST, "--port", String(config.port)],
-    {
-      env: {
-        ...process.env,
-        ...config.env,
-      },
-      detached: true,
-      stdio: "ignore",
-    },
-  );
-
-  const proxy: ManagedProxyState = {
-    provider: config.provider,
-    port: config.port,
-    rootUrl: config.rootUrl,
-    routedBaseUrl: config.routedBaseUrl,
-        pid: child.pid,
-    process: child,
-    status: "starting",
-  };
-
-  child.on("error", (error: Error) => {
-    proxy.status = "failed";
-    proxy.lastError = error.message;
-  });
-  child.on("exit", (code: number | null, signal: string | null) => {
-    proxy.process = undefined;
-    proxy.status = "stopped";
-    proxy.lastHealthyAt = undefined;
-    proxy.lastError = signal
-      ? `process exited via signal ${signal}`
-      : code === 0
-        ? undefined
-        : `process exited with code ${code ?? "unknown"}`;
-  });
-  child.unref();
-
-  return proxy;
-}
-
-async function resolveKnownState(
-  provider: ManagedProvider,
-): Promise<ManagedProxyState | undefined> {
-  const state = globalState();
-  const cached = state.proxies.get(provider);
-  if (cached && (await probeLiveness(cached.rootUrl))) {
-    return markHealthy(cached);
-  }
-
-  const config = getConfig(provider);
-  const service = loadServiceMetadata(provider);
-  const healthy = await probeLiveness(config.rootUrl);
-  if (
-    healthy &&
-    service &&
-    service.port === config.port &&
-    processAlive(service.pid)
-  ) {
-    const managed = markHealthy({
-      ...buildBaseState(config),
-      pid: service.pid,
-    });
-    state.proxies.set(provider, managed);
-    return managed;
-  }
-
-  if (service && !processAlive(service.pid)) clearServiceMetadata(provider);
-  return undefined;
-}
-
-async function recoverUnhealthyManagedService(
-  provider: ManagedProvider,
-  config: ManagedProxyConfig,
-): Promise<void> {
-  const service = loadServiceMetadata(provider);
-  if (!service) return;
-  if (!processAlive(service.pid)) {
-    clearServiceMetadata(provider);
-    return;
-  }
-
-  const serviceConfig =
-    service.port === config.port
-      ? config
-      : buildManagedProxyConfig(provider, service.port, DEFAULT_HOST);
-  if (await probeLiveness(serviceConfig.rootUrl)) return;
-
-  const proxy = buildBaseState(serviceConfig);
-  proxy.pid = service.pid;
-  proxy.status = "failed";
-  proxy.lastError = "managed service became unhealthy; restarting";
-  await terminateProxy(proxy);
-  globalState().proxies.delete(provider);
-  globalState().perf.delete(provider);
-}
-
-async function ensureProxyRunning(
+async function reconcileProviderRouting(
+  pi: ExtensionAPI,
   provider: ManagedProvider,
 ): Promise<ManagedProxyState> {
-  const state = globalState();
-  const existing = state.proxies.get(provider);
-  if (isFreshHealthy(existing)) return existing;
-
-  const pending = state.pending.get(provider);
-  if (pending) return pending;
-
-  const config = getConfig(provider);
-  const promise = (async () => {
-    const known = await resolveKnownState(provider);
-    if (known && known.status !== "stopped" && known.status !== "failed") {
-      return known;
-    }
-
-    if (!AUTOSTART) {
-      throw new Error(
-        `No healthy managed Headroom proxy for ${provider} at ${config.rootUrl}. Start it manually with this package or enable PI_HEADROOM_AUTOSTART.`,
-      );
-    }
-
-    const releaseStartLock = await acquireStartLock(provider);
-    try {
-      const lockedKnown = await resolveKnownState(provider);
-      if (
-        lockedKnown &&
-        lockedKnown.status !== "stopped" &&
-        lockedKnown.status !== "failed"
-      ) {
-        return lockedKnown;
-      }
-
-      await recoverUnhealthyManagedService(provider, config);
-
-      const assessment = await assessPort(provider, config.port);
-      if (assessment.disposition !== "free") {
-        const reason =
-          assessment.disposition === "headroom"
-            ? "already has another Headroom proxy"
-            : "is occupied by a non-Headroom service";
-        throw new Error(
-          `Selected port ${config.port} for ${provider} ${reason}. Reload pi to rescan fallback ports or free that port.`,
-        );
-      }
-
-      const spawned = spawnProxy(config);
-      state.proxies.set(provider, spawned);
-      try {
-        await waitForReady(config, spawned);
-        saveServiceMetadata(config, spawned);
-        return spawned;
-      } catch (error) {
-        spawned.status = "failed";
-        spawned.lastError =
-          error instanceof Error ? error.message : String(error);
-        clearServiceMetadata(provider);
-        throw error;
-      }
-    } finally {
-      releaseStartLock();
-    }
-  })();
-
-  state.pending.set(provider, promise);
-  try {
-    return await promise;
-  } finally {
-    state.pending.delete(provider);
+  const proxy = await ensureObservedState(provider);
+  if (proxy.status === "running") {
+    registerManagedProvider(pi, provider, getConfig(provider));
+    await refreshPerfSummary(provider);
+  } else {
+    pi.unregisterProvider(provider);
+    globalState().perf.delete(provider);
   }
+  return proxy;
 }
 
-async function terminateProxy(proxy: ManagedProxyState): Promise<void> {
-  if (!proxy.pid) return;
-
-  try {
-    process.kill(proxy.pid, "SIGTERM");
-  } catch {
-    clearServiceMetadata(proxy.provider);
-    proxy.status = "stopped";
-    proxy.lastHealthyAt = undefined;
-    proxy.process = undefined;
-    return;
-  }
-
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
-    if (!(await probeLiveness(proxy.rootUrl))) {
-      clearServiceMetadata(proxy.provider);
-      proxy.status = "stopped";
-      proxy.lastHealthyAt = undefined;
-      proxy.process = undefined;
-      return;
-    }
-    await sleep(150);
-  }
-
-  try {
-    process.kill(proxy.pid, "SIGKILL");
-  } catch {
-    // already gone
-  }
-
-  clearServiceMetadata(proxy.provider);
-  proxy.status = "stopped";
-  proxy.lastHealthyAt = undefined;
-  proxy.process = undefined;
-}
-
-async function ensureForCurrentModel(
+async function refreshForModel(
+  pi: ExtensionAPI,
   model: ProviderModel | undefined,
 ): Promise<void> {
   const provider = managedProviderFor(model);
   if (!provider) return;
-  await ensureProxyRunning(provider);
+  await reconcileProviderRouting(pi, provider);
 }
 
-function warmInBackground(
-  model: ProviderModel | undefined,
-  ctx: ExtensionCtx,
-  source: string,
-): void {
-  const provider = managedProviderFor(model);
-  updateUiStatus(ctx, model);
-  if (!provider) return;
-  if (headroomInstallProblem) {
-    if (VERBOSE) notifyHeadroomUnavailable(ctx, model);
-    return;
-  }
-
-  void ensureProxyRunning(provider)
-    .then(async () => {
-      await refreshPerfSummary(provider);
-      updateUiStatus(ctx, model);
-      if (VERBOSE) {
-        notifyUi(
-          ctx,
-          `Headroom proxy ready for ${provider} (${source})`,
-          "info",
-        );
-      }
-    })
-    .catch((error) => {
-      updateUiStatus(ctx, model);
-      notifyUi(
-        ctx,
-        `Headroom background start failed for ${provider}: ${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-    });
-}
-
-function parseProviderArg(
-  raw: string | undefined,
-): ManagedProvider | "all" | undefined {
+function parseProviderArg(raw: string | undefined): ManagedProvider | "all" | undefined {
   const value = raw?.trim().toLowerCase();
   if (!value) return undefined;
   if (value === "all") return "all";
@@ -1097,40 +521,45 @@ function parseProviderArg(
     : undefined;
 }
 
-async function managedStateFor(
-  provider: ManagedProvider,
-): Promise<ManagedProxyState | undefined> {
-  const state = globalState();
-  const current = state.proxies.get(provider);
-  if (current?.pid) return current;
-
-  const service = loadServiceMetadata(provider);
-  if (!service || !processAlive(service.pid)) {
-    clearServiceMetadata(provider);
-    return undefined;
-  }
-
-  const config = getConfig(provider);
-  const proxy = buildBaseState(config);
-  proxy.pid = service.pid;
-  if (await probeLiveness(config.rootUrl)) {
-    markHealthy(proxy);
-  }
-  state.proxies.set(provider, proxy);
-  return proxy;
-}
-
-function registerCommands(pi: ExtensionAPI): void {
 function registerCommands(pi: ExtensionAPI): void {
   pi.registerCommand(STATUS_COMMAND, {
-    description: "Show Headroom proxy routing and supervisor status.",
-    handler: async (_args: string, ctx: ExtensionCtx) => {
+    description:
+      "Show Headroom routing, expected proxy ports, and observed proxy status.",
+    handler: async (args: string, ctx: ExtensionCtx) => {
+      const selected = parseProviderArg(args);
+      if (args.trim() && !selected) {
+        const known = [...providerIds(), "all"].join(", ");
+        notifyUi(
+          ctx,
+          `Unknown provider ${JSON.stringify(args.trim())}. Use ${known}.`,
+          "error",
+        );
+        return;
+      }
+
+      const currentProvider = managedProviderFor(currentModelOrUndefined(ctx));
+      const providers = selected
+        ? selected !== "all"
+          ? [selected]
+          : providerIds()
+        : currentProvider
+          ? [currentProvider]
+          : [];
+      if (!providers.length) {
+        notifyUi(
+          ctx,
+          "No managed provider selected. Choose a managed model first or pass /headroom-status [provider|all].",
+          "error",
+        );
+        return;
+      }
       await Promise.all(
-        providerIds().map((provider) => resolveKnownState(provider)),
+        providers.map((provider) => reconcileProviderRouting(pi, provider)),
       );
+
       const model = currentModelOrUndefined(ctx);
       const activeProvider = managedProviderFor(model);
-      if (activeProvider) {
+      if (activeProvider && providers.includes(activeProvider)) {
         await refreshPerfSummary(activeProvider, { fresh: true });
       }
       updateUiStatus(ctx, model);
@@ -1138,19 +567,10 @@ function registerCommands(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerCommand(STOP_COMMAND, {
-    description: "Stop managed Headroom provider proxies. Usage: /headroom-stop [provider|all]",
+  pi.registerCommand(START_COMMAND, {
+    description:
+      "Start Headroom on the canonical configured port. Usage: /headroom-start [provider|all]",
     handler: async (args: string, ctx: ExtensionCtx) => {
-      if (headroomInstallProblem) {
-        updateUiStatus(ctx);
-        notifyUi(
-          ctx,
-          `Headroom unavailable; managed providers are using pi defaults. ${headroomInstallProblem}`,
-          "warn",
-        );
-        return;
-      }
-
       const selected = parseProviderArg(args);
       if (args.trim() && !selected) {
         const known = [...providerIds(), "all"].join(", ");
@@ -1162,72 +582,84 @@ function registerCommands(pi: ExtensionAPI): void {
         return;
       }
 
-      const providers =
-        selected && selected !== "all" ? [selected] : providerIds();
-      const stopped: ManagedProvider[] = [];
-
-      for (const provider of providers) {
-        const proxy = await managedStateFor(provider);
-        if (!proxy) continue;
-        await terminateProxy(proxy);
-        globalState().proxies.delete(provider);
-        globalState().perf.delete(provider);
-        stopped.push(provider);
-      }
-
-      updateUiStatus(ctx);
-      notifyUi(
-        ctx,
-        stopped.length
-          ? `Stopped managed Headroom proxy for ${stopped.join(", ")}.`
-          : "No managed Headroom proxy to stop.",
-        "info",
-      );
-    },
-  });
-
-  pi.registerCommand(RESTART_COMMAND, {
-    description: "Restart managed Headroom provider proxies. Usage: /headroom-restart [provider|all]",
-    handler: async (args: string, ctx: ExtensionCtx) => {
-      if (headroomInstallProblem) {
-        updateUiStatus(ctx);
+      const currentProvider = managedProviderFor(currentModelOrUndefined(ctx));
+      const providers = selected
+        ? selected !== "all"
+          ? [selected]
+          : providerIds()
+        : currentProvider
+          ? [currentProvider]
+          : [];
+      if (!providers.length) {
         notifyUi(
           ctx,
-          `Headroom unavailable; managed providers are using pi defaults. ${headroomInstallProblem}`,
-          "warn",
-        );
-        return;
-      }
-
-      const selected = parseProviderArg(args);
-      if (args.trim() && !selected) {
-        const known = [...providerIds(), "all"].join(", ");
-        notifyUi(
-          ctx,
-          `Unknown provider ${JSON.stringify(args.trim())}. Use ${known}.`,
+          "No managed provider selected. Choose a managed model first or pass /headroom-start [provider|all].",
           "error",
         );
         return;
       }
 
-      const providers =
-        selected && selected !== "all" ? [selected] : providerIds();
+      const started: ManagedProvider[] = [];
+      const alreadyRunning: ManagedProvider[] = [];
+      const failures: string[] = [];
+
       for (const provider of providers) {
-        const proxy = await managedStateFor(provider);
-        if (proxy) {
-          await terminateProxy(proxy);
-          globalState().proxies.delete(provider);
-          globalState().perf.delete(provider);
+        const config = getConfig(provider);
+        if (await probeLiveness(config.rootUrl)) {
+          await reconcileProviderRouting(pi, provider);
+          alreadyRunning.push(provider);
+          continue;
         }
-        await ensureProxyRunning(provider);
-        await refreshPerfSummary(provider);
+
+        if (!(await probePortBindable(config.port))) {
+          failures.push(
+            `${provider}: port ${config.port} is occupied. Expected command: ${buildStartCommand(provider)}`,
+          );
+          continue;
+        }
+
+        try {
+          const child = spawn(
+            HEADROOM_BIN,
+            ["proxy", "--host", DEFAULT_HOST, "--port", String(config.port)],
+            {
+              env: { ...process.env, ...config.env },
+              detached: true,
+              stdio: "ignore",
+            },
+          );
+          child.unref();
+        } catch (error) {
+          failures.push(
+            `${provider}: failed to start Headroom via ${JSON.stringify(HEADROOM_BIN)}. ${error instanceof Error ? error.message : String(error)}`,
+          );
+          continue;
+        }
+
+        const ready = await waitForProxyReady(config.rootUrl);
+        if (!ready) {
+          failures.push(
+            `${provider}: timed out waiting for proxy on ${config.rootUrl}. Expected command: ${buildStartCommand(provider)}`,
+          );
+          continue;
+        }
+
+        await reconcileProviderRouting(pi, provider);
+        started.push(provider);
       }
 
-      updateUiStatus(ctx);
+      const model = currentModelOrUndefined(ctx);
+      updateUiStatus(ctx, model);
+
+      const notices: string[] = [];
+      if (started.length) notices.push(`Started Headroom for ${started.join(", ")}.`);
+      if (alreadyRunning.length) notices.push(`Already running: ${alreadyRunning.join(", ")}.`);
+      if (failures.length) notices.push(...failures);
+
       notifyUi(
         ctx,
-        `Restarted managed Headroom proxy for ${providers.join(", ")}.`,
-        "info",
+        notices.length ? notices.join("\n") : "No managed providers selected.",
+        failures.length ? "warn" : "info",
       );
     },
   });
@@ -1236,62 +668,23 @@ function registerCommands(pi: ExtensionAPI): void {
 export default async function headroomProviderSupervisor(
   pi: ExtensionAPI,
 ): Promise<void> {
-  headroomInstallProblem = detectHeadroomInstallProblem();
-  await initializeConfigs();
-  if (!headroomInstallProblem) {
-    registerManagedProviders(pi, getConfig);
+  for (const provider of providerIds()) {
+    pi.unregisterProvider(provider);
   }
   registerCommands(pi);
 
   pi.on("session_start", async (_event: unknown, ctx: ExtensionCtx) => {
-    updateUiStatus(ctx);
-    if (headroomInstallProblem) {
-      notifyHeadroomUnavailable(ctx, ctx.model, { once: true });
-      return;
-    }
-    warmInBackground(ctx.model, ctx, "session_start");
+    const model = currentModelOrUndefined(ctx);
+    await refreshForModel(pi, model);
+    updateUiStatus(ctx, model);
   });
 
   pi.on("model_select", async (event: ModelSelectEvent, ctx: ExtensionCtx) => {
+    await refreshForModel(pi, event.model);
     updateUiStatus(ctx, event.model);
-    if (headroomInstallProblem) {
-      notifyHeadroomUnavailable(ctx, event.model, { once: true });
-      return;
-    }
-    warmInBackground(event.model, ctx, "model_select");
   });
 
   pi.on("before_agent_start", async (_event: unknown, ctx: ExtensionCtx) => {
-    if (headroomInstallProblem) {
-      updateUiStatus(ctx);
-      return;
-    }
-    const model = currentModelOrUndefined(ctx);
-    try {
-      updateUiStatus(ctx, model);
-      await ensureForCurrentModel(model);
-      const provider = managedProviderFor(model);
-      if (provider) {
-        await refreshPerfSummary(provider);
-      }
-      updateUiStatus(ctx, model);
-    } catch (error) {
-      updateUiStatus(ctx, model);
-      notifyUi(
-        ctx,
-        `Headroom route unavailable: ${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-      throw error;
-    }
-  });
-
-  pi.on("agent_end", async (_event: unknown, ctx: ExtensionCtx) => {
-    if (headroomInstallProblem) {
-      updateUiStatus(ctx);
-      return;
-    }
-
     const model = currentModelOrUndefined(ctx);
     const provider = managedProviderFor(model);
     if (!provider) {
@@ -1299,8 +692,42 @@ export default async function headroomProviderSupervisor(
       return;
     }
 
+    const proxy = await reconcileProviderRouting(pi, provider);
+    updateUiStatus(ctx, model);
+    if (proxy.status !== "running") {
+      notifyUi(
+        ctx,
+        `${buildUnavailableMessage(provider)} Falling back to the provider default.`,
+        "warn",
+      );
+    }
+  });
+
+  pi.on("agent_end", async (_event: unknown, ctx: ExtensionCtx) => {
+    const model = currentModelOrUndefined(ctx);
+    const provider = managedProviderFor(model);
+    if (!provider) {
+      updateUiStatus(ctx, model);
+      return;
+    }
+    await reconcileProviderRouting(pi, provider);
     await refreshPerfSummary(provider, { fresh: true });
     updateUiStatus(ctx, model);
   });
 
+  if (VERBOSE) {
+    pi.on("session_start", async (_event: unknown, ctx: ExtensionCtx) => {
+      const model = currentModelOrUndefined(ctx);
+      const provider = managedProviderFor(model);
+      if (!provider) return;
+      const proxy = await ensureObservedState(provider);
+      if (proxy.status !== "running") {
+        notifyUi(
+          ctx,
+          `${buildUnavailableMessage(provider)} Using the provider default until Headroom is available.`,
+          "warn",
+        );
+      }
+    });
+  }
 }

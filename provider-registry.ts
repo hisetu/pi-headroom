@@ -519,11 +519,19 @@ export function buildManagedProxyConfig(
   };
 }
 
+export function registerManagedProvider(
+  pi: ExtensionAPI,
+  provider: ManagedProvider,
+  config: ManagedProxyConfig,
+): void {
+  getManagedProviderSpec(provider).register(pi, config);
+}
+
 export function registerManagedProviders(
   pi: ExtensionAPI,
   getConfig: (provider: ManagedProvider) => ManagedProxyConfig,
 ): void {
   for (const provider of providerIds()) {
-    getManagedProviderSpec(provider).register(pi, getConfig(provider));
+    registerManagedProvider(pi, provider, getConfig(provider));
   }
 }
