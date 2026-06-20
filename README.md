@@ -1,6 +1,6 @@
 # @linimin/pi-headroom
 
-A pi extension that automatically routes supported pi providers through local Headroom proxies.
+A pi extension that routes supported pi providers through local Headroom proxies.
 
 ## Quickstart
 
@@ -8,7 +8,7 @@ A pi extension that automatically routes supported pi providers through local He
 # 1) Install Headroom first
 curl -fsSL https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.sh | bash
 
-# 2) Install the pi package
+# 2) Install this pi package
 pi install npm:@linimin/pi-headroom
 ```
 
@@ -22,7 +22,7 @@ Then open pi and run:
 
 ## What this extension does
 
-When you choose a supported provider in pi, this extension:
+When you choose a supported provider in pi, the extension:
 
 - overrides that provider's `baseUrl` to a local Headroom proxy,
 - starts the proxy automatically if it is not already running,
@@ -31,29 +31,23 @@ When you choose a supported provider in pi, this extension:
 - shows proxy status in the pi footer,
 - shows dashboard URLs and routing details in `/headroom-status`.
 
-The goal is simple:
-
-> install Headroom, install this pi package, then use supported providers in pi without manually starting proxies.
+The goal is simple: install Headroom, install this pi package, then use supported providers in pi without manually starting proxies.
 
 ## Prerequisite
 
-You must install **Headroom** first.
-
-This package does **not** install Headroom for you. It expects the `headroom` CLI to be available on `PATH`.
+You must install **Headroom** first. This package does **not** install Headroom for you. It expects the `headroom` CLI to be available on `PATH`.
 
 If Headroom is missing, the extension will:
 
 - warn clearly,
 - leave pi usable,
-- and let unmanaged/default pi provider behavior continue.
+- let unmanaged/default pi provider behavior continue.
 
 ## Install
 
 ### 1. Install Headroom
 
-See the Headroom install docs, or use the official installer for your platform.
-
-Typical examples:
+See the official Headroom install docs for your platform. Typical examples:
 
 #### macOS
 
@@ -87,9 +81,9 @@ If pi is already running, reload extensions:
 
 ## Enable / use
 
-1. Open pi
-2. Select a supported provider/model with `/model`
-3. Start using the model normally
+1. Open pi.
+2. Select a supported provider/model with `/model`.
+3. Start using the model normally.
 
 The extension will auto-start the matching local Headroom proxy when needed.
 
@@ -106,11 +100,11 @@ You should see:
 - the current managed provider,
 - the current routed local base URL,
 - the active dashboard URL,
-- each managed provider's proxy state.
+- the managed provider proxy state.
 
 ## Supported providers
 
-### OpenAI-style routed through `/v1`
+### OpenAI-style, routed through `/v1`
 
 - `xai`
 - `github-copilot`
@@ -130,7 +124,7 @@ You should see:
 - `xiaomi-token-plan-ams`
 - `xiaomi-token-plan-sgp`
 
-### Anthropic-style routed through root URL
+### Anthropic-style, routed through the root URL
 
 - `anthropic`
 - `fireworks`
@@ -146,7 +140,7 @@ You should see:
 
 ## Default local ports
 
-These are the preferred starting ports before fallback scanning:
+Preferred ports with fallback scanning:
 
 - `xai` → `8787`
 - `github-copilot` → `8788`
@@ -174,13 +168,11 @@ These are the preferred starting ports before fallback scanning:
 - `xiaomi-token-plan-sgp` → `8810`
 - `kimi-coding` → `8811`
 
-If a preferred port is occupied by a non-Headroom service, the extension scans for the next free fallback port and persists that route.
-
 ## Commands
 
 ### `/headroom-status`
 
-Show:
+Shows:
 
 - current provider,
 - current model base URL,
@@ -212,7 +204,7 @@ Headroom:openai running | hist saved 33.0M | $83.3 | 36%
 - By default, each provider uses one shared managed proxy that stays available across pi sessions and agent processes.
 - Proxy startup is serialized across processes so one provider converges on one managed proxy.
 - If a managed provider proxy becomes unhealthy, the extension automatically stops and restarts it on demand.
-- Footer perf numbers prefer Headroom Historical Proxy Compression data (`/stats-history` lifetime stats, `/stats` fallback), so they survive proxy restarts better than per-process runtime counters.
+- Footer perf numbers prefer Headroom Historical Proxy Compression data (`/stats-history` lifetime stats, with `/stats` fallback), so they survive proxy restarts better than per-process runtime counters.
 - GitHub Copilot keeps pi's built-in OAuth flow and re-routes the final base URL through Headroom.
 
 ## Useful environment
