@@ -150,6 +150,11 @@ function routedBaseUrlFor(style: RoutedBaseStyle, rootUrl: string): string {
   }
 }
 
+function isCopilotAnthropicModel(model: ProviderModel): boolean {
+  const id = typeof model.id === "string" ? model.id.trim().toLowerCase() : "";
+  return id.startsWith("claude-");
+}
+
 function registerBaseUrlOverride(
   provider: ManagedProvider,
   pi: ExtensionAPI,
@@ -247,11 +252,15 @@ const PROVIDER_SPECS: Record<ManagedProvider, ManagedProviderSpec> = {
             const oauthAdjusted = oauthProvider.modifyModels
               ? oauthProvider.modifyModels(models, credentials)
               : models;
-            return oauthAdjusted.map((model) =>
-              model.provider === "github-copilot"
-                ? { ...model, baseUrl: config.routedBaseUrl }
-                : model,
-            );
+            return oauthAdjusted.map((model) => {
+              if (model.provider !== "github-copilot") return model;
+              return {
+                ...model,
+                baseUrl: isCopilotAnthropicModel(model)
+                  ? config.rootUrl
+                  : config.routedBaseUrl,
+              };
+            });
           },
         },
       });

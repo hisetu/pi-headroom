@@ -266,6 +266,7 @@ Headroom:github-copilot unavailable | /headroom-start github-copilot
 - Footer perf numbers prefer Headroom Historical Proxy Compression data (`/stats-history` lifetime stats, with `/stats` fallback).
 - GitHub Copilot keeps pi's built-in OAuth flow and re-routes the final base URL through Headroom.
 - For GitHub Copilot, explicit `GITHUB_COPILOT_API_TOKEN` takes priority. Without it, the default is Headroom token exchange unless you explicitly opt in to reusing Pi's local access token via `PI_HEADROOM_COPILOT_REUSE_PI_ACCESS_TOKEN=1`.
+- GitHub Copilot models are routed by model family: OpenAI-style models such as `gpt-*` keep `/v1`, while Anthropic-style models such as `claude-*` route to the proxy root so Anthropic clients do not produce duplicated paths like `/v1/v1/messages`.
 
 ## Useful environment
 
