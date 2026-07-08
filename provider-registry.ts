@@ -105,6 +105,11 @@ function readPiCopilotAccessToken(): string | undefined {
   }
 }
 
+function parseBooleanEnv(raw: string | undefined, fallback = false): boolean {
+  if (!raw?.trim()) return fallback;
+  return /^(1|true|yes|on)$/i.test(raw.trim());
+}
+
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (!raw?.trim()) return fallback;
   const value = Number.parseInt(raw.trim(), 10);
@@ -206,8 +211,14 @@ const PROVIDER_SPECS: Record<ManagedProvider, ManagedProviderSpec> = {
     preferredPortEnv: "PI_HEADROOM_COPILOT_PORT",
     defaultPreferredPort: 8788,
     buildProxyEnv() {
+      const explicitApiToken = process.env.GITHUB_COPILOT_API_TOKEN?.trim();
+      const reusePiAccessToken = parseBooleanEnv(
+        process.env.PI_HEADROOM_COPILOT_REUSE_PI_ACCESS_TOKEN,
+        false,
+      );
       const accessToken =
-        process.env.GITHUB_COPILOT_API_TOKEN?.trim() || readPiCopilotAccessToken();
+        explicitApiToken || (reusePiAccessToken ? readPiCopilotAccessToken() : undefined);
+      const defaultUseTokenExchange = accessToken ? "0" : "1";
 
       return {
         HEADROOM_BACKEND: "openai",
@@ -215,7 +226,7 @@ const PROVIDER_SPECS: Record<ManagedProvider, ManagedProviderSpec> = {
           process.env.PI_HEADROOM_COPILOT_UPSTREAM?.trim() ||
           "https://api.githubcopilot.com",
         GITHUB_COPILOT_USE_TOKEN_EXCHANGE:
-          process.env.PI_HEADROOM_COPILOT_USE_TOKEN_EXCHANGE?.trim() || "0",
+          process.env.PI_HEADROOM_COPILOT_USE_TOKEN_EXCHANGE?.trim() || defaultUseTokenExchange,
         ...(accessToken ? { GITHUB_COPILOT_API_TOKEN: accessToken } : {}),
         LITELLM_SUPPRESS_DEBUG_INFO: "True",
       };

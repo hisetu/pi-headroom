@@ -104,7 +104,17 @@ Then edit `.env` if you want to point a provider at a different upstream.
 
 For `github-copilot` in Docker, prefer setting an explicit `GITHUB_COPILOT_TOKEN` or `GITHUB_COPILOT_GITHUB_TOKEN` in `.env`. Docker containers generally cannot reuse your host keychain/session auth the same way local host processes can.
 
-For `github-copilot` on Business seats, prefer starting the proxy through `/headroom-start github-copilot` or otherwise ensure the proxy process has a current `GITHUB_COPILOT_API_TOKEN`. Reusing a host OAuth token through Headroom token exchange can downgrade the available model set for the proxy process.
+For `github-copilot` on Business seats, prefer starting the proxy through `/headroom-start github-copilot` or otherwise ensure the proxy process has a current `GITHUB_COPILOT_API_TOKEN`.
+
+By default, `pi-headroom` does **not** scrape `~/.pi/agent/auth.json` and reuse Pi's local Copilot access token for the proxy process. If no explicit `GITHUB_COPILOT_API_TOKEN` is set, it now defaults back to Headroom token exchange.
+
+If you explicitly want to reuse Pi's local Copilot access token for Headroom, opt in with:
+
+```bash
+export PI_HEADROOM_COPILOT_REUSE_PI_ACCESS_TOKEN=1
+```
+
+This opt-in path can still behave differently from Pi's direct built-in OAuth flow, so if a model works without Headroom but fails through Headroom, first try leaving this opt-in disabled.
 
 ## Enable / use
 
@@ -255,6 +265,7 @@ Headroom:github-copilot unavailable | /headroom-start github-copilot
 - If the expected proxy is unavailable, the extension falls back to the provider default and tells you what should be running and where.
 - Footer perf numbers prefer Headroom Historical Proxy Compression data (`/stats-history` lifetime stats, with `/stats` fallback).
 - GitHub Copilot keeps pi's built-in OAuth flow and re-routes the final base URL through Headroom.
+- For GitHub Copilot, explicit `GITHUB_COPILOT_API_TOKEN` takes priority. Without it, the default is Headroom token exchange unless you explicitly opt in to reusing Pi's local access token via `PI_HEADROOM_COPILOT_REUSE_PI_ACCESS_TOKEN=1`.
 
 ## Useful environment
 
